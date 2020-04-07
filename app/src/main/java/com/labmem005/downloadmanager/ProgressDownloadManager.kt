@@ -9,12 +9,14 @@ import android.database.ContentObserver
 import android.database.Cursor
 import android.net.Uri
 import android.os.Environment
+import android.os.Environment.DIRECTORY_DOWNLOADS
 import android.os.Handler
 import android.os.Looper
 import android.os.Message
 import android.util.Log
 import androidx.annotation.NonNull
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 
 /**
@@ -30,6 +32,9 @@ class ProgressDownloadManager constructor(
 
     private lateinit var url: String
     private lateinit var subPath: String
+    private val downloadedFilePath by lazy {
+        Environment.getExternalStoragePublicDirectory(DIRECTORY_DOWNLOADS).absolutePath + "/" + subPath
+    }
 
     private val downloadManager by lazy {
         context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
@@ -46,11 +51,12 @@ class ProgressDownloadManager constructor(
         DownloadChangeObserver()
     }
     private var downloadId: Long = 0
+    private var scheduledFuture: ScheduledFuture<*>? = null
 
     /**
      * @param url 下载地址
      */
-    fun setUrl(@NonNull url: String): ProgressDownloadManager{
+    fun setUrl(@NonNull url: String): ProgressDownloadManager {
         this.url = url
         this.subPath = getFileNameByUrl(url)
         return this
@@ -59,7 +65,7 @@ class ProgressDownloadManager constructor(
     /**
      * @param subPath 下载完成后的文件名#Download/{subPath}
      */
-    fun setSubPath(subPath: String): ProgressDownloadManager{
+    fun setSubPath(subPath: String): ProgressDownloadManager {
         this.subPath = subPath
         return this
     }
@@ -77,36 +83,53 @@ class ProgressDownloadManager constructor(
      */
     fun download() {
         val request = DownloadManager.Request(Uri.parse(url))
-        request.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS,getFileNameByUrl(url))
+        request.setDestinationInExternalPublicDir(DIRECTORY_DOWNLOADS, subPath)
         downloadListener?.onPrepare()
         val uri = Uri.parse("content://downloads/all_downloads") // 标识/Download
-        context.contentResolver.registerContentObserver(uri,false,contentObserver)
-        context.registerReceiver(receiver, IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE).apply {
-            addAction(DownloadManager.ACTION_NOTIFICATION_CLICKED)
-        })
+        context.contentResolver.registerContentObserver(uri, false, contentObserver)
+        context.registerReceiver(
+            receiver,
+            IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE).apply {
+                addAction(DownloadManager.ACTION_NOTIFICATION_CLICKED)
+            })
         downloadId = downloadManager.enqueue(request)
 
+    }
+
+    /**
+     * 取消下载
+     */
+    fun cancel() {
+        if (downloadId != 0L)
+            downloadManager.remove(downloadId)
+        unSubscribe()
     }
 
     private val receiver: BroadcastReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             Log.d(TAG, intent.toString())
-            val downloadId = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID,-1)
+            val downloadId = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1)
             when (intent.action) {
                 DownloadManager.ACTION_DOWNLOAD_COMPLETE -> {
-                    //收到ACTION_DOWNLOAD_COMPLETE广播后，此时立刻unSubscribe会导致scheduledExecutorService查询到的已下载文件比例不足100%
-                    //可根据具体情况delay几秒调用或主动发送sendMessage(1,1)
-                    unSubscribe()
-                    if (downloadId == -1L) return
+                    if (downloadId == -1L) {
+                        unSubscribe()
+                        return
+                    }
+
                     val uri = downloadManager.getUriForDownloadedFile(downloadId)
-                    if (uri!=null)
-                        uri.path?.let {
-                            downloadListener?.onSuccess(it)
+                    if (uri != null) {
+                        downloadHandler.apply {
+                            sendMessage(obtainMessage(HANDLE_DOWNLOAD, 1, 1))
                         }
-                    else
+                        downloadListener?.onSuccess(downloadedFilePath)
+                    } else
                         downloadListener?.onFailed(Exception("下载失败,id=$downloadId"))
+                    //下载成功后，延迟取消订阅
+                    downloadHandler.postDelayed({
+                        unSubscribe()
+                    }, 500)
                 }
-                DownloadManager.ACTION_NOTIFICATION_CLICKED ->{
+                DownloadManager.ACTION_NOTIFICATION_CLICKED -> {
                     downloadListener?.onNotificationClicked()
                 }
             }
@@ -122,9 +145,8 @@ class ProgressDownloadManager constructor(
          * @param selfChange
          */
         override fun onChange(selfChange: Boolean) {
-            Log.d(TAG,"on change:$selfChange")
-
-            scheduledExecutorService.scheduleAtFixedRate(
+            Log.d(TAG, "on change:$selfChange")
+            scheduledFuture = scheduledExecutorService.scheduleAtFixedRate(
                 {
                     val bytesAndStatus = getBytesAndStatus(downloadId)
                     downloadHandler.sendMessage(
@@ -156,9 +178,12 @@ class ProgressDownloadManager constructor(
         try {
             cursor = downloadManager.query(query)
             if (cursor != null && cursor.moveToFirst()) {
-                bytesAndStatus[0] = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR))
-                bytesAndStatus[1] = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES))
-                bytesAndStatus[2] = cursor.getInt(cursor.getColumnIndex(DownloadManager.COLUMN_STATUS))
+                bytesAndStatus[0] =
+                    cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR))
+                bytesAndStatus[1] =
+                    cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES))
+                bytesAndStatus[2] =
+                    cursor.getInt(cursor.getColumnIndex(DownloadManager.COLUMN_STATUS))
             }
         } finally {
             cursor?.close()
@@ -168,41 +193,60 @@ class ProgressDownloadManager constructor(
 
     /**
      * 关闭定时器，线程等操作
+     * 收到ACTION_DOWNLOAD_COMPLETE广播后，此时立刻unSubscribe会导致scheduledExecutorService查询到的已下载文件比例不足100%
+     * 可根据具体情况delay几秒调用或主动发送sendMessage(1,1)
      */
     fun unSubscribe() {
         context.unregisterReceiver(receiver)
         context.contentResolver.unregisterContentObserver(contentObserver)
-        if (!scheduledExecutorService.isShutdown) {
-            scheduledExecutorService.shutdownNow()
-        }
+        scheduledFuture?.cancel(true)
         downloadHandler.removeCallbacksAndMessages(null)
     }
 
-    interface DownloadListener{
+    interface DownloadListener {
         //初始化UI
-        fun onPrepare()
+        fun onPrepare() {}
+
         //点击通知栏回调
-        fun onNotificationClicked()
+        fun onNotificationClicked() {}
+
+        //为获取到下载总大小时回调，用于另行处理ProgressBar样式
+        fun onUnknownTotalSize() {}
+
         //下载进度回调
         fun onProgress(progress: Float)
+
         //下载完成
         fun onSuccess(path: String)
+
         //下载失败
         fun onFailed(throwable: Throwable)
     }
 
     companion object {
         private val TAG = ProgressDownloadManager::class.java.simpleName
+
+        //保证onUnknownTotalSize回调一次
+        private var flag = false
+        private var count = 0
+
         const val HANDLE_DOWNLOAD = 0x001
 
-        private class DownloadHandler(val downloadListener: DownloadListener?) : Handler(Looper.getMainLooper()) {
+        private class DownloadHandler(val downloadListener: DownloadListener?) :
+            Handler(Looper.getMainLooper()) {
 
             override fun handleMessage(msg: Message) {
                 super.handleMessage(msg)
-                if (msg.what == HANDLE_DOWNLOAD){
-                    Log.d(TAG,"arg1=${msg.arg1},arg2=${msg.arg2}")
+                if (msg.what == HANDLE_DOWNLOAD) {
+                    Log.d(TAG, "arg1=${msg.arg1},arg2=${msg.arg2}")
                     if (msg.arg1 >= 0 && msg.arg2 > 0) {
                         downloadListener?.onProgress(msg.arg1 / msg.arg2.toFloat())
+                    } else {
+                        count++
+                        if (!flag && count > 5) {
+                            downloadListener?.onUnknownTotalSize()
+                            flag = true
+                        }
                     }
                 }
             }
@@ -213,7 +257,10 @@ class ProgressDownloadManager constructor(
          */
         private fun getFileNameByUrl(url: String): String {
             var filename = url.substring(url.lastIndexOf("/") + 1)
-            filename = filename.substring(0, if (filename.indexOf("?") == -1) filename.length else filename.indexOf("?"))
+            filename = filename.substring(
+                0,
+                if (filename.indexOf("?") == -1) filename.length else filename.indexOf("?")
+            )
             return filename
         }
     }
